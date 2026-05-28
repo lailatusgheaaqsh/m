@@ -17,12 +17,21 @@ Semua kode digabung jadi satu file: `main.py`.
 # 1. install dependencies
 pip install -r requirements.txt
 
-# 2. login akun tumbal (interaktif: phone + OTP) — sekali saja
-python main.py auth
-
-# 3. jalankan semua service
+# 2. jalankan
 python main.py
 ```
+
+Pertama kali dijalankan, kalau session userbot belum ada, kamu akan diminta:
+
+1. Nomor HP (format internasional, contoh: `+628xxxxxxx`)
+2. Kode OTP yang dikirim Telegram
+3. Password 2FA (kalau akun mengaktifkan)
+
+Setelah itu file `userbot_session.session` akan dibuat dan dipakai otomatis
+di run berikutnya — tidak perlu login lagi.
+
+Kalau perlu force re-login (misal ganti akun tumbal), hapus file
+`userbot_session.session` lalu jalankan ulang.
 
 ## Konfigurasi
 
