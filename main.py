@@ -186,6 +186,13 @@ class Database:
             await db.commit()
             return cur.rowcount > 0
 
+    async def deactivate_child_bot(self, bot_db_id) -> None:
+        async with self._conn() as db:
+            await db.execute(
+                "UPDATE child_bots SET active=0 WHERE id=?", (bot_db_id,)
+            )
+            await db.commit()
+
     # ---------- channels ----------
     async def upsert_channel(self, chat_id, title, username) -> int:
         async with self._conn() as db:
@@ -300,11 +307,19 @@ class Userbot:
         self._me = None
 
     async def start(self) -> None:
-        await self.client.connect()
+        # Connect dulu untuk cek session
+        if not self.client.is_connected():
+            await self.client.connect()
         if not await self.client.is_user_authorized():
-            raise RuntimeError(
-                "Userbot belum login. Jalankan: python main.py auth"
-            )
+            log.warning("=" * 60)
+            log.warning("Session userbot BELUM ADA. Memulai login interaktif.")
+            log.warning("Anda akan diminta:")
+            log.warning("  1) Nomor HP (format internasional, contoh: +628xxx)")
+            log.warning("  2) Kode OTP yang dikirim Telegram")
+            log.warning("  3) Password 2FA (kalau akun mengaktifkan)")
+            log.warning("=" * 60)
+            # client.start() handle phone + code + 2FA password lewat input()
+            await self.client.start()
         self._me = await self.client.get_me()
         log.info("Userbot login as @%s (id=%s)", self._me.username, self._me.id)
 
@@ -993,20 +1008,48 @@ class ChildBotManager:
     async def start(self) -> None:
         if self.dp is None:
             raise RuntimeError("set_userbot() harus dipanggil sebelum start()")
-        for r in await self.db.get_all_child_bots():
-            await self.add_bot(token=r["token"], bot_db_id=r["id"])
-        log.info("ChildBotManager started with %d bot(s)", len(self.bots))
+        rows = await self.db.get_all_child_bots()
+        ok, fail = 0, 0
+        for r in rows:
+            spawned = await self.add_bot(token=r["token"], bot_db_id=r["id"])
+            if spawned:
+                ok += 1
+            else:
+                fail += 1
+        log.info(
+            "ChildBotManager started: %d active, %d skipped (invalid).",
+            ok, fail,
+        )
 
-    async def add_bot(self, token: str, bot_db_id: int) -> None:
+    async def add_bot(self, token: str, bot_db_id: int) -> bool:
+        """Spawn polling task untuk bot anak. Return True kalau sukses,
+        False kalau token invalid (bot dinonaktifkan di DB, tidak crash).
+        """
         if bot_db_id in self.bots:
-            return
+            return True
         bot = Bot(
             token=token,
             default=DefaultBotProperties(parse_mode=ParseMode.HTML),
         )
+        # Validasi token sebelum mulai polling, supaya 1 token rusak
+        # tidak menjatuhkan service.
+        try:
+            await bot.get_me()
+        except Exception as e:
+            log.warning(
+                "Skip bot anak db_id=%s, token invalid: %s",
+                bot_db_id, e,
+            )
+            try:
+                await bot.session.close()
+            except Exception:
+                pass
+            await self.db.deactivate_child_bot(bot_db_id)
+            return False
         self.bots[bot_db_id] = bot
         self.tasks[bot_db_id] = asyncio.create_task(self._poll(bot, bot_db_id))
         log.info("Spawned child bot db_id=%s", bot_db_id)
+        return True
 
     async def _poll(self, bot: Bot, bot_db_id: int) -> None:
         try:
@@ -1014,7 +1057,11 @@ class ChildBotManager:
         except asyncio.CancelledError:
             raise
         except Exception:
-            log.exception("Child bot polling crashed db_id=%s", bot_db_id)
+            log.exception(
+                "Child bot polling crashed db_id=%s (bot tetap nonaktif "
+                "sampai restart, service lain jalan terus)",
+                bot_db_id,
+            )
 
     async def remove_bot(self, bot_db_id: int) -> None:
         task = self.tasks.pop(bot_db_id, None)
