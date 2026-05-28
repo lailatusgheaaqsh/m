@@ -395,6 +395,51 @@ class Userbot:
 # =============================================================================
 TOKEN_RE = re.compile(r"^\d{6,12}:[A-Za-z0-9_-]{30,}$")
 
+# Telegram menolak premium emoji yang invalid dengan error berikut:
+_PREMIUM_REJECT_TOKENS = ("DOCUMENT_INVALID", "MEDIA_INVALID",
+                          "EMOJI_INVALID", "CUSTOM_EMOJI")
+_TG_EMOJI_RE = re.compile(r"<tg-emoji[^>]*>(.*?)</tg-emoji>", re.DOTALL)
+
+
+def _strip_premium_emoji_html(s: str) -> str:
+    """Replace <tg-emoji ...>FALLBACK</tg-emoji> with FALLBACK text."""
+    return _TG_EMOJI_RE.sub(r"\1", s)
+
+
+class SafeBot(Bot):
+    """Bot yang otomatis fallback kalau premium emoji ditolak Telegram.
+
+    Beberapa premium emoji ID mungkin tidak bisa diakses oleh bot
+    (placeholder ID, sticker premium yang tidak available, dll).
+    Telegram membalas DOCUMENT_INVALID / MEDIA_INVALID / EMOJI_INVALID
+    untuk seluruh pesan. Tanpa fallback, bot akan crash dan user
+    tidak terima apa pun.
+
+    SafeBot men-catch error itu, strip semua <tg-emoji> tag jadi
+    fallback emoji biasa, lalu retry.
+    """
+
+    async def __call__(self, method, request_timeout=None):
+        try:
+            return await super().__call__(method, request_timeout=request_timeout)
+        except TelegramBadRequest as e:
+            err = str(e).upper()
+            if not any(tok in err for tok in _PREMIUM_REJECT_TOKENS):
+                raise
+            updates = {}
+            for field in ("text", "caption"):
+                val = getattr(method, field, None)
+                if isinstance(val, str) and "<tg-emoji" in val:
+                    updates[field] = _strip_premium_emoji_html(val)
+            if not updates:
+                raise
+            log.warning(
+                "Premium emoji ditolak Telegram (%s), retry tanpa premium emoji.",
+                e.message if hasattr(e, "message") else e,
+            )
+            method2 = method.model_copy(update=updates)
+            return await super().__call__(method2, request_timeout=request_timeout)
+
 
 def _kb(*rows) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=list(rows))
@@ -410,7 +455,7 @@ class AddBotState(StatesGroup):
 
 class MainBot:
     def __init__(self, token: str, db: Database, child_manager: "ChildBotManager"):
-        self.bot = Bot(
+        self.bot = SafeBot(
             token=token,
             default=DefaultBotProperties(parse_mode=ParseMode.HTML),
         )
