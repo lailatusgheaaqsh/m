@@ -37,13 +37,19 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     Message,
 )
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, utils as tl_utils
 from telethon.errors import (
     ChannelPrivateError,
     FloodWaitError,
     UserAlreadyParticipantError,
+    InviteHashExpiredError,
+    InviteHashInvalidError,
 )
 from telethon.tl.functions.channels import JoinChannelRequest
+from telethon.tl.functions.messages import (
+    CheckChatInviteRequest,
+    ImportChatInviteRequest,
+)
 
 
 # =============================================================================
@@ -220,6 +226,32 @@ class Database:
             )
             return [r["chat_id"] for r in await cur.fetchall()]
 
+    async def get_all_channels_full(self):
+        """Semua row channel yang punya minimal 1 bot anak terkait."""
+        async with self._conn() as db:
+            cur = await db.execute(
+                "SELECT DISTINCT c.* FROM channels c "
+                "JOIN bot_channels bc ON bc.channel_id = c.id"
+            )
+            return list(await cur.fetchall())
+
+    async def update_channel_chat_id(self, channel_db_id: int, new_chat_id: int) -> bool:
+        async with self._conn() as db:
+            try:
+                await db.execute(
+                    "UPDATE channels SET chat_id=? WHERE id=?",
+                    (new_chat_id, channel_db_id),
+                )
+                await db.commit()
+                return True
+            except aiosqlite.IntegrityError:
+                # ada row lain dengan chat_id sama -> hapus duplikat
+                await db.execute(
+                    "DELETE FROM channels WHERE id=?", (channel_db_id,)
+                )
+                await db.commit()
+                return False
+
     # ---------- bot_channels ----------
     async def link_bot_channel(self, bot_db_id, channel_db_id) -> bool:
         async with self._conn() as db:
@@ -323,14 +355,29 @@ class Userbot:
         self._me = await self.client.get_me()
         log.info("Userbot login as @%s (id=%s)", self._me.username, self._me.id)
 
-        # warm up cache
-        for cid in await self.db.get_all_channel_chat_ids():
+        # Warm up cache + migrasi chat_id ke format yang konsisten dengan
+        # event.chat_id. Channel yang ditambahkan di versi lama mungkin
+        # punya chat_id format berbeda. Tanpa ini, get_bots_for_channel()
+        # tidak akan match dengan event.chat_id dan notif tidak nyala.
+        for ch in await self.db.get_all_channels_full():
             try:
-                await self.client.get_entity(cid)
+                entity = await self.client.get_entity(ch["chat_id"])
+                canonical = tl_utils.get_peer_id(entity)
+                if canonical != ch["chat_id"]:
+                    log.warning(
+                        "[migrate] channel db_id=%s chat_id %s -> %s",
+                        ch["id"], ch["chat_id"], canonical,
+                    )
+                    await self.db.update_channel_chat_id(ch["id"], canonical)
             except Exception as e:
-                log.warning("Resolve channel %s gagal: %s", cid, e)
+                log.warning(
+                    "Resolve channel %s gagal saat warm-up: %s. "
+                    "Pastikan akun tumbal sudah join.",
+                    ch["chat_id"], e,
+                )
 
         self.client.add_event_handler(self._on_message, events.NewMessage())
+        log.info("Userbot listening untuk pesan baru di semua channel...")
 
     async def run(self) -> None:
         await self.client.run_until_disconnected()
@@ -341,10 +388,15 @@ class Userbot:
             if chat_id is None:
                 return
             text = event.message.message or ""
+            log.debug(
+                "[userbot] new message chat_id=%s text=%r",
+                chat_id, (text[:80] + "...") if len(text) > 80 else text,
+            )
             if not text:
                 return
             bots = await self.db.get_bots_for_channel(chat_id)
             if not bots:
+                log.debug("[userbot] no bot watching chat_id=%s", chat_id)
                 return
             text_lower = text.lower()
             for bot_row in bots:
@@ -354,7 +406,15 @@ class Userbot:
                     None,
                 )
                 if not matched:
+                    log.debug(
+                        "[userbot] no trigger matched bot_id=%s (triggers=%s)",
+                        bot_row["id"], [t["keyword"] for t in triggers],
+                    )
                     continue
+                log.info(
+                    "[userbot] MATCH bot_id=%s keyword=%r chat_id=%s",
+                    bot_row["id"], matched["keyword"], chat_id,
+                )
                 link = await self._build_link(event)
                 await self.child_manager.notify_owner(
                     bot_row=bot_row,
@@ -372,13 +432,65 @@ class Userbot:
         username = getattr(chat, "username", None)
         if username:
             return f"https://t.me/{username}/{msg_id}"
-        chat_id_str = str(chat.id)
-        if chat_id_str.startswith("-100"):
-            chat_id_str = chat_id_str[4:]
-        return f"https://t.me/c/{chat_id_str}/{msg_id}"
+        # Private channel/supergroup: format https://t.me/c/<raw_id>/<msg_id>
+        raw_id = getattr(chat, "id", None)
+        if raw_id is None:
+            return ""
+        return f"https://t.me/c/{raw_id}/{msg_id}"
 
     async def join_channel(self, identifier: str):
-        entity = await self.client.get_entity(identifier)
+        """Join channel berdasarkan @username, t.me link, atau invite link.
+
+        Mendukung:
+          - @username
+          - https://t.me/username
+          - https://t.me/joinchat/HASH       (private invite)
+          - https://t.me/+HASH               (private invite, format baru)
+        """
+        ident = identifier.strip()
+
+        # deteksi invite hash dari berbagai format link
+        invite_hash = None
+        for prefix in ("https://t.me/joinchat/", "http://t.me/joinchat/",
+                       "t.me/joinchat/", "joinchat/"):
+            if ident.startswith(prefix):
+                invite_hash = ident[len(prefix):]
+                break
+        if invite_hash is None:
+            for prefix in ("https://t.me/+", "http://t.me/+", "t.me/+"):
+                if ident.startswith(prefix):
+                    invite_hash = ident[len(prefix):]
+                    break
+
+        if invite_hash:
+            invite_hash = invite_hash.split("/")[0].split("?")[0]
+            try:
+                info = await self.client(CheckChatInviteRequest(invite_hash))
+                if hasattr(info, "chat") and info.chat is not None:
+                    return info.chat
+                upd = await self.client(ImportChatInviteRequest(invite_hash))
+                if getattr(upd, "chats", None):
+                    return upd.chats[0]
+                raise RuntimeError("Tidak bisa resolve channel dari invite link.")
+            except UserAlreadyParticipantError:
+                info = await self.client(CheckChatInviteRequest(invite_hash))
+                if hasattr(info, "chat") and info.chat is not None:
+                    return info.chat
+                raise RuntimeError("Sudah join tapi tidak bisa resolve chat.")
+            except (InviteHashExpiredError, InviteHashInvalidError):
+                raise RuntimeError("Invite link expired/invalid.")
+            except FloodWaitError as e:
+                raise RuntimeError(f"FloodWait {e.seconds}s, coba lagi nanti.")
+
+        # public username / t.me link
+        for prefix in ("https://t.me/", "http://t.me/", "t.me/"):
+            if ident.startswith(prefix):
+                ident = ident[len(prefix):]
+                break
+        ident = ident.lstrip("@").split("/")[0].split("?")[0]
+        if not ident:
+            raise RuntimeError("Identifier kosong.")
+        entity = await self.client.get_entity(ident)
         try:
             await self.client(JoinChannelRequest(entity))
         except UserAlreadyParticipantError:
@@ -874,6 +986,54 @@ def build_child_dispatcher(db: Database, userbot: Userbot) -> Dispatcher:
         if row:
             await _show_status(message, row)
 
+    @dp.message(Command("debug"))
+    async def debug_cmd(message: Message, bot: Bot) -> None:
+        """Diagnostik: tampilkan state internal bot anak ini."""
+        row = await _owner_only(message, bot)
+        if not row:
+            return
+        chs = await db.get_channels_for_bot(row["id"])
+        tgs = await db.get_triggers_for_bot(row["id"])
+
+        ub_status = "OFFLINE"
+        ub_id = ub_user = "-"
+        try:
+            if userbot.client.is_connected() and userbot._me is not None:
+                ub_status = "ONLINE"
+                ub_id = userbot._me.id
+                ub_user = f"@{userbot._me.username}" if userbot._me.username else "-"
+        except Exception:
+            pass
+
+        ch_lines = []
+        for c in chs:
+            line = f"  • <code>{c['chat_id']}</code> — {html.escape(c['title'] or '')}"
+            if c["username"]:
+                line += f" (@{c['username']})"
+            ch_lines.append(line)
+        tg_lines = [f"  • <code>{html.escape(t['keyword'])}</code>" for t in tgs]
+
+        text = (
+            f"🛠 <b>Debug Info</b>\n\n"
+            f"<b>Bot anak</b>\n"
+            f"  db_id   : <code>{row['id']}</code>\n"
+            f"  bot_id  : <code>{row['bot_id']}</code>\n"
+            f"  owner   : <code>{row['owner_id']}</code>\n"
+            f"  active  : <code>{row['active']}</code>\n\n"
+            f"<b>Userbot tumbal</b>\n"
+            f"  status  : <code>{ub_status}</code>\n"
+            f"  user    : <code>{ub_user}</code>\n"
+            f"  user_id : <code>{ub_id}</code>\n\n"
+            f"<b>Channel ({len(chs)})</b>\n"
+            + ("\n".join(ch_lines) if ch_lines else "  <i>(kosong)</i>")
+            + f"\n\n<b>Trigger ({len(tgs)})</b>\n"
+            + ("\n".join(tg_lines) if tg_lines else "  <i>(kosong)</i>")
+            + "\n\n<b>Cara cek</b>\n"
+            f"Pastikan akun tumbal <b>sudah join</b> ke channel di atas. "
+            f"Lalu kirim pesan di channel itu yang mengandung salah satu trigger."
+        )
+        await message.answer(text)
+
     # ---- nav ----
     @dp.callback_query(F.data == "home")
     async def cb_home(query: CallbackQuery, bot: Bot, state: FSMContext) -> None:
@@ -951,11 +1111,16 @@ def build_child_dispatcher(db: Database, userbot: Userbot) -> Dispatcher:
         if chat_id_raw is None:
             await message.answer("⚠️ Gagal resolve channel.")
             return
-        is_channel = (
-            getattr(entity, "broadcast", False)
-            or getattr(entity, "megagroup", False)
-        )
-        chat_id_full = int(f"-100{chat_id_raw}") if is_channel else chat_id_raw
+        # Pakai utils.get_peer_id() supaya format chat_id sama dengan
+        # event.chat_id yang akan dilihat oleh handler NewMessage.
+        try:
+            chat_id_full = tl_utils.get_peer_id(entity)
+        except Exception:
+            is_channel = (
+                getattr(entity, "broadcast", False)
+                or getattr(entity, "megagroup", False)
+            )
+            chat_id_full = int(f"-100{chat_id_raw}") if is_channel else chat_id_raw
         title = getattr(entity, "title", "") or ""
         username = getattr(entity, "username", None)
 
@@ -1150,6 +1315,10 @@ class ChildBotManager:
                 reply_markup=kb,
                 disable_web_page_preview=False,
             )
+            log.info(
+                "[notify] sent to owner=%s via bot db_id=%s keyword=%r",
+                bot_row["owner_id"], bot_row["id"], keyword,
+            )
         except Exception as e:
             log.warning("Gagal kirim notifikasi ke %s: %s", bot_row["owner_id"], e)
 
@@ -1220,10 +1389,16 @@ async def run_all() -> None:
 
 
 def cli() -> None:
+    import os
+    level = logging.DEBUG if os.environ.get("LOG_DEBUG") else logging.INFO
     logging.basicConfig(
-        level=logging.INFO,
+        level=level,
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     )
+    # kurangi noise dari library
+    logging.getLogger("telethon").setLevel(logging.WARNING)
+    logging.getLogger("aiogram").setLevel(logging.WARNING)
+    logging.getLogger("aiohttp").setLevel(logging.WARNING)
     if len(sys.argv) > 1 and sys.argv[1] == "auth":
         asyncio.run(auth_userbot())
     else:
