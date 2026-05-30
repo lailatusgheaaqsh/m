@@ -1,15 +1,26 @@
-"""Telegram Bot System - Single-file edition.
+"""Telegram Bot Trigger System - Optimized Single-File Edition.
 
 Komponen:
-- Userbot (Telethon)   : akun tumbal yang memantau channel.
-- Main Bot (aiogram)   : tempat user mendaftarkan bot anak (pakai premium emoji).
+- Userbot (Telethon)   : 1 akun "tumbal" yang memantau pesan baru di channel.
+- Main Bot (aiogram)   : tempat user mendaftarkan & mengelola bot anak (premium emoji).
 - Child Bots (aiogram) : 1 dispatcher dipakai bersama, satu polling task per bot.
-- Database (aiosqlite) : SQLite, foreign keys ON, WAL mode.
+- Database (aiosqlite) : SQLite, foreign keys ON, WAL, single shared connection.
+
+Optimasi performa:
+- Single shared aiosqlite connection (skip overhead open/close per query).
+- In-memory cache: chat_id -> [bot_ids], bot_id -> [triggers]. Invalidate
+  saat add/remove. Match path bypass DB sepenuhnya (sub-millisecond).
+- uvloop kalau tersedia (lebih cepat dari asyncio default).
+- Auto-join channel saat add (kalau belum join).
+- Premium emoji auto-fallback (DOCUMENT_INVALID safe).
+- Auto-skip token bot anak invalid saat startup.
+- Migrasi chat_id otomatis ke format canonical (telethon.utils.get_peer_id).
+- Send retry dengan FloodWait awareness.
+- Auto deactivate bot anak yang owner-nya block bot (TelegramForbiddenError).
 
 Cara pakai:
     pip install -r requirements.txt
-    python main.py auth     # login akun tumbal pertama kali (interaktif: phone+OTP)
-    python main.py          # jalankan semua service
+    python main.py        # pertama kali: prompt phone+OTP via stdin
 """
 
 from __future__ import annotations
@@ -17,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import os
 import re
 import signal
 import sys
@@ -27,7 +39,11 @@ import aiosqlite
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramRetryAfter,
+)
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -37,30 +53,41 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     Message,
 )
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, utils as tl_utils
 from telethon.errors import (
     ChannelPrivateError,
     FloodWaitError,
+    InviteHashExpiredError,
+    InviteHashInvalidError,
     UserAlreadyParticipantError,
 )
 from telethon.tl.functions.channels import JoinChannelRequest
+from telethon.tl.functions.messages import (
+    CheckChatInviteRequest,
+    ImportChatInviteRequest,
+)
 
 
 # =============================================================================
 # CONFIG
 # =============================================================================
-BOT_TOKEN = "8842160943:AAGyDhc2XGNw3oBQtPm7zda3o3pSsx2x_xI"
-API_ID = 32066244
-API_HASH = "0e20794ad29409b7f18cc37f7e3c4001"
-SESSION_NAME = "userbot_session"
-DB_PATH = "data.db"
+BOT_TOKEN = os.environ.get(
+    "BOT_TOKEN",
+    "8842160943:AAGyDhc2XGNw3oBQtPm7zda3o3pSsx2x_xI",
+)
+API_ID = int(os.environ.get("API_ID", "32066244"))
+API_HASH = os.environ.get("API_HASH", "0e20794ad29409b7f18cc37f7e3c4001")
+SESSION_NAME = os.environ.get("SESSION_NAME", "userbot_session")
+DB_PATH = os.environ.get("DB_PATH", "data.db")
 
 # Kosong = semua user boleh /addbot. Isi list user_id untuk mengunci main bot.
-ADMIN_IDS: list[int] = []
+ADMIN_IDS: list[int] = [
+    int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().isdigit()
+]
 
 
 # =============================================================================
-# PREMIUM EMOJI HELPERS (HTML <tg-emoji> tag dengan fallback)
+# PREMIUM EMOJI HELPERS
 # =============================================================================
 def _e(emoji_id: str, fallback: str) -> str:
     return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
@@ -82,13 +109,24 @@ E_GEAR   = _e("5307843983102204243", "⚙️")
 E_ROCKET = _e("5328221650884260273", "🚀")
 E_TRASH  = _e("5472239203590888751", "🗑")
 
+_TG_EMOJI_RE = re.compile(r"<tg-emoji[^>]*>(.*?)</tg-emoji>", re.DOTALL)
+_PREMIUM_REJECT = ("DOCUMENT_INVALID", "MEDIA_INVALID",
+                   "EMOJI_INVALID", "CUSTOM_EMOJI")
+
+
+def _strip_premium_emoji_html(s: str) -> str:
+    return _TG_EMOJI_RE.sub(r"\1", s)
+
 
 # =============================================================================
-# DATABASE (aiosqlite)
+# DATABASE — single shared connection + WAL + FK cascade
 # =============================================================================
 SCHEMA = """
 PRAGMA journal_mode=WAL;
+PRAGMA synchronous=NORMAL;
 PRAGMA foreign_keys=ON;
+PRAGMA temp_store=MEMORY;
+PRAGMA cache_size=-20000;
 
 CREATE TABLE IF NOT EXISTS child_bots (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -126,68 +164,98 @@ CREATE TABLE IF NOT EXISTS triggers (
 );
 
 CREATE INDEX IF NOT EXISTS idx_bot_channels_channel ON bot_channels(channel_id);
+CREATE INDEX IF NOT EXISTS idx_bot_channels_bot     ON bot_channels(bot_id);
 CREATE INDEX IF NOT EXISTS idx_triggers_bot         ON triggers(bot_id);
+CREATE INDEX IF NOT EXISTS idx_child_bots_owner     ON child_bots(owner_id);
 """
 
 
 class Database:
+    """Single-connection async SQLite wrapper.
+
+    aiosqlite menjalankan SQLite di thread terpisah; satu Connection sudah
+    cukup untuk semua throughput kita. Ini menghilangkan ~2-5ms overhead
+    per query (open + WAL setup) dibanding bikin connection baru tiap call.
+    """
+
     def __init__(self, path: str):
         self.path = path
-
-    @asynccontextmanager
-    async def _conn(self):
-        async with aiosqlite.connect(self.path) as db:
-            db.row_factory = aiosqlite.Row
-            await db.execute("PRAGMA foreign_keys=ON")
-            yield db
+        self._conn: Optional[aiosqlite.Connection] = None
+        # write lock supaya commit tidak bertabrakan (read aman concurrent di WAL)
+        self._wlock = asyncio.Lock()
 
     async def init(self) -> None:
-        async with aiosqlite.connect(self.path) as db:
-            await db.executescript(SCHEMA)
-            await db.commit()
+        self._conn = await aiosqlite.connect(self.path)
+        self._conn.row_factory = aiosqlite.Row
+        await self._conn.executescript(SCHEMA)
+        await self._conn.commit()
+
+    async def close(self) -> None:
+        if self._conn is not None:
+            try:
+                await self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                await self._conn.commit()
+            except Exception:
+                pass
+            await self._conn.close()
+            self._conn = None
+
+    @asynccontextmanager
+    async def write(self):
+        """Context manager untuk operasi write (serialized via lock)."""
+        async with self._wlock:
+            yield self._conn
+
+    @property
+    def conn(self) -> aiosqlite.Connection:
+        assert self._conn is not None, "Database belum di-init()"
+        return self._conn
 
     # ---------- child_bots ----------
     async def add_child_bot(self, token, bot_id, bot_username, owner_id) -> int:
-        async with self._conn() as db:
+        async with self.write() as db:
             cur = await db.execute(
-                "INSERT INTO child_bots (token, bot_id, bot_username, owner_id) VALUES (?, ?, ?, ?)",
+                "INSERT INTO child_bots (token, bot_id, bot_username, owner_id) "
+                "VALUES (?, ?, ?, ?)",
                 (token, bot_id, bot_username, owner_id),
             )
             await db.commit()
             return cur.lastrowid
 
     async def get_child_bot(self, bot_db_id):
-        async with self._conn() as db:
-            cur = await db.execute("SELECT * FROM child_bots WHERE id=?", (bot_db_id,))
-            return await cur.fetchone()
+        cur = await self.conn.execute(
+            "SELECT * FROM child_bots WHERE id=?", (bot_db_id,)
+        )
+        return await cur.fetchone()
 
     async def get_child_bot_by_token(self, token):
-        async with self._conn() as db:
-            cur = await db.execute("SELECT * FROM child_bots WHERE token=?", (token,))
-            return await cur.fetchone()
+        cur = await self.conn.execute(
+            "SELECT * FROM child_bots WHERE token=?", (token,)
+        )
+        return await cur.fetchone()
 
     async def get_child_bots_by_owner(self, owner_id):
-        async with self._conn() as db:
-            cur = await db.execute(
-                "SELECT * FROM child_bots WHERE owner_id=? ORDER BY id DESC", (owner_id,)
-            )
-            return list(await cur.fetchall())
+        cur = await self.conn.execute(
+            "SELECT * FROM child_bots WHERE owner_id=? ORDER BY id DESC",
+            (owner_id,),
+        )
+        return list(await cur.fetchall())
 
     async def get_all_child_bots(self):
-        async with self._conn() as db:
-            cur = await db.execute("SELECT * FROM child_bots WHERE active=1")
-            return list(await cur.fetchall())
+        cur = await self.conn.execute("SELECT * FROM child_bots WHERE active=1")
+        return list(await cur.fetchall())
 
     async def delete_child_bot(self, bot_db_id, owner_id) -> bool:
-        async with self._conn() as db:
+        async with self.write() as db:
             cur = await db.execute(
-                "DELETE FROM child_bots WHERE id=? AND owner_id=?", (bot_db_id, owner_id)
+                "DELETE FROM child_bots WHERE id=? AND owner_id=?",
+                (bot_db_id, owner_id),
             )
             await db.commit()
             return cur.rowcount > 0
 
     async def deactivate_child_bot(self, bot_db_id) -> None:
-        async with self._conn() as db:
+        async with self.write() as db:
             await db.execute(
                 "UPDATE child_bots SET active=0 WHERE id=?", (bot_db_id,)
             )
@@ -195,8 +263,10 @@ class Database:
 
     # ---------- channels ----------
     async def upsert_channel(self, chat_id, title, username) -> int:
-        async with self._conn() as db:
-            cur = await db.execute("SELECT id FROM channels WHERE chat_id=?", (chat_id,))
+        async with self.write() as db:
+            cur = await db.execute(
+                "SELECT id FROM channels WHERE chat_id=?", (chat_id,)
+            )
             row = await cur.fetchone()
             if row:
                 await db.execute(
@@ -212,17 +282,32 @@ class Database:
             await db.commit()
             return cur.lastrowid
 
-    async def get_all_channel_chat_ids(self):
-        async with self._conn() as db:
-            cur = await db.execute(
-                "SELECT DISTINCT c.chat_id FROM channels c "
-                "JOIN bot_channels bc ON bc.channel_id = c.id"
-            )
-            return [r["chat_id"] for r in await cur.fetchall()]
+    async def get_all_channels_full(self):
+        cur = await self.conn.execute(
+            "SELECT DISTINCT c.* FROM channels c "
+            "JOIN bot_channels bc ON bc.channel_id = c.id"
+        )
+        return list(await cur.fetchall())
+
+    async def update_channel_chat_id(self, channel_db_id: int, new_chat_id: int) -> bool:
+        async with self.write() as db:
+            try:
+                await db.execute(
+                    "UPDATE channels SET chat_id=? WHERE id=?",
+                    (new_chat_id, channel_db_id),
+                )
+                await db.commit()
+                return True
+            except aiosqlite.IntegrityError:
+                await db.execute(
+                    "DELETE FROM channels WHERE id=?", (channel_db_id,)
+                )
+                await db.commit()
+                return False
 
     # ---------- bot_channels ----------
     async def link_bot_channel(self, bot_db_id, channel_db_id) -> bool:
-        async with self._conn() as db:
+        async with self.write() as db:
             try:
                 await db.execute(
                     "INSERT INTO bot_channels (bot_id, channel_id) VALUES (?, ?)",
@@ -234,7 +319,7 @@ class Database:
                 return False
 
     async def unlink_bot_channel(self, bot_db_id, channel_db_id) -> bool:
-        async with self._conn() as db:
+        async with self.write() as db:
             cur = await db.execute(
                 "DELETE FROM bot_channels WHERE bot_id=? AND channel_id=?",
                 (bot_db_id, channel_db_id),
@@ -243,29 +328,27 @@ class Database:
             return cur.rowcount > 0
 
     async def get_channels_for_bot(self, bot_db_id):
-        async with self._conn() as db:
-            cur = await db.execute(
-                "SELECT c.* FROM channels c "
-                "JOIN bot_channels bc ON bc.channel_id = c.id "
-                "WHERE bc.bot_id=? ORDER BY c.id DESC",
-                (bot_db_id,),
-            )
-            return list(await cur.fetchall())
+        cur = await self.conn.execute(
+            "SELECT c.* FROM channels c "
+            "JOIN bot_channels bc ON bc.channel_id = c.id "
+            "WHERE bc.bot_id=? ORDER BY c.id DESC",
+            (bot_db_id,),
+        )
+        return list(await cur.fetchall())
 
     async def get_bots_for_channel(self, chat_id):
-        async with self._conn() as db:
-            cur = await db.execute(
-                "SELECT cb.* FROM child_bots cb "
-                "JOIN bot_channels bc ON bc.bot_id = cb.id "
-                "JOIN channels c ON c.id = bc.channel_id "
-                "WHERE c.chat_id=? AND cb.active=1",
-                (chat_id,),
-            )
-            return list(await cur.fetchall())
+        cur = await self.conn.execute(
+            "SELECT cb.* FROM child_bots cb "
+            "JOIN bot_channels bc ON bc.bot_id = cb.id "
+            "JOIN channels c      ON c.id     = bc.channel_id "
+            "WHERE c.chat_id=? AND cb.active=1",
+            (chat_id,),
+        )
+        return list(await cur.fetchall())
 
     # ---------- triggers ----------
     async def add_trigger(self, bot_db_id, keyword) -> bool:
-        async with self._conn() as db:
+        async with self.write() as db:
             try:
                 await db.execute(
                     "INSERT INTO triggers (bot_id, keyword) VALUES (?, ?)",
@@ -277,60 +360,181 @@ class Database:
                 return False
 
     async def remove_trigger(self, trigger_id, bot_db_id) -> bool:
-        async with self._conn() as db:
+        async with self.write() as db:
             cur = await db.execute(
-                "DELETE FROM triggers WHERE id=? AND bot_id=?", (trigger_id, bot_db_id)
+                "DELETE FROM triggers WHERE id=? AND bot_id=?",
+                (trigger_id, bot_db_id),
             )
             await db.commit()
             return cur.rowcount > 0
 
     async def get_triggers_for_bot(self, bot_db_id):
-        async with self._conn() as db:
-            cur = await db.execute(
-                "SELECT * FROM triggers WHERE bot_id=? ORDER BY id DESC", (bot_db_id,)
-            )
-            return list(await cur.fetchall())
+        cur = await self.conn.execute(
+            "SELECT * FROM triggers WHERE bot_id=? ORDER BY id DESC",
+            (bot_db_id,),
+        )
+        return list(await cur.fetchall())
 
 
 # =============================================================================
-# USERBOT (Telethon "tumbal")
+# IN-MEMORY CACHE — match path tanpa DB roundtrip
+# =============================================================================
+class TriggerCache:
+    """Cache untuk hot path (event handler userbot).
+
+    Layout:
+      chat_index : { chat_id -> [bot_db_id, ...] }
+      bot_meta   : { bot_db_id -> {"id","token","bot_id","bot_username","owner_id"} }
+      triggers   : { bot_db_id -> [(trig_id, keyword_lower), ...] }
+
+    Semua read di event handler bypass DB. Refresh hanya saat:
+      - startup (full reload)
+      - add/remove bot/channel/trigger (granular invalidate)
+    """
+
+    def __init__(self, db: Database):
+        self.db = db
+        self.chat_index: dict[int, list[int]] = {}
+        self.bot_meta: dict[int, dict] = {}
+        self.triggers: dict[int, list[tuple[int, str]]] = {}
+        self._lock = asyncio.Lock()
+
+    async def reload_all(self) -> None:
+        async with self._lock:
+            self.chat_index.clear()
+            self.bot_meta.clear()
+            self.triggers.clear()
+
+            # bot meta
+            for b in await self.db.get_all_child_bots():
+                self.bot_meta[b["id"]] = dict(b)
+
+            # bot_channels mapping
+            cur = await self.db.conn.execute(
+                "SELECT c.chat_id, bc.bot_id FROM bot_channels bc "
+                "JOIN channels c ON c.id = bc.channel_id "
+                "JOIN child_bots cb ON cb.id = bc.bot_id "
+                "WHERE cb.active=1"
+            )
+            for row in await cur.fetchall():
+                self.chat_index.setdefault(row["chat_id"], []).append(row["bot_id"])
+
+            # triggers
+            cur = await self.db.conn.execute(
+                "SELECT t.id, t.bot_id, t.keyword FROM triggers t "
+                "JOIN child_bots cb ON cb.id = t.bot_id "
+                "WHERE cb.active=1"
+            )
+            for row in await cur.fetchall():
+                self.triggers.setdefault(row["bot_id"], []).append(
+                    (row["id"], row["keyword"].lower())
+                )
+
+    async def reload_bot(self, bot_db_id: int) -> None:
+        """Refresh entry untuk satu bot anak (dipanggil saat add/remove channel/trigger)."""
+        async with self._lock:
+            row = await self.db.get_child_bot(bot_db_id)
+            if not row or not row["active"]:
+                self._evict_bot_unsafe(bot_db_id)
+                return
+            self.bot_meta[bot_db_id] = dict(row)
+            # rebuild triggers
+            tgs = await self.db.get_triggers_for_bot(bot_db_id)
+            self.triggers[bot_db_id] = [(t["id"], t["keyword"].lower()) for t in tgs]
+            # rebuild chat_index untuk bot ini
+            for cid, bots in list(self.chat_index.items()):
+                if bot_db_id in bots:
+                    bots.remove(bot_db_id)
+                if not bots:
+                    self.chat_index.pop(cid, None)
+            chs = await self.db.get_channels_for_bot(bot_db_id)
+            for c in chs:
+                self.chat_index.setdefault(c["chat_id"], []).append(bot_db_id)
+
+    async def evict_bot(self, bot_db_id: int) -> None:
+        async with self._lock:
+            self._evict_bot_unsafe(bot_db_id)
+
+    def _evict_bot_unsafe(self, bot_db_id: int) -> None:
+        self.bot_meta.pop(bot_db_id, None)
+        self.triggers.pop(bot_db_id, None)
+        for cid in list(self.chat_index.keys()):
+            if bot_db_id in self.chat_index[cid]:
+                self.chat_index[cid].remove(bot_db_id)
+            if not self.chat_index[cid]:
+                self.chat_index.pop(cid, None)
+
+    async def update_chat_id(self, old: int, new: int) -> None:
+        async with self._lock:
+            if old in self.chat_index:
+                self.chat_index[new] = self.chat_index.pop(old)
+
+    # hot path — sync, no lock (read GIL-safe untuk dict assign)
+    def lookup(self, chat_id: int, text_lower: str):
+        """Return list of (bot_meta, matched_keyword) or empty list."""
+        bot_ids = self.chat_index.get(chat_id)
+        if not bot_ids:
+            return []
+        results = []
+        for bid in bot_ids:
+            tgs = self.triggers.get(bid, ())
+            for _tid, kw in tgs:
+                if kw in text_lower:
+                    meta = self.bot_meta.get(bid)
+                    if meta:
+                        results.append((meta, kw))
+                    break  # first match per bot
+        return results
+
+
+# =============================================================================
+# USERBOT (Telethon)
 # =============================================================================
 log = logging.getLogger("system")
 
 
 class Userbot:
-    def __init__(self, api_id, api_hash, session, db: "Database",
-                 child_manager: "ChildBotManager"):
+    def __init__(self, api_id, api_hash, session, db: Database,
+                 cache: TriggerCache, child_manager: "ChildBotManager"):
         self.client = TelegramClient(session, api_id, api_hash)
         self.db = db
+        self.cache = cache
         self.child_manager = child_manager
         self._me = None
 
     async def start(self) -> None:
-        # Connect dulu untuk cek session
         if not self.client.is_connected():
             await self.client.connect()
         if not await self.client.is_user_authorized():
             log.warning("=" * 60)
-            log.warning("Session userbot BELUM ADA. Memulai login interaktif.")
-            log.warning("Anda akan diminta:")
-            log.warning("  1) Nomor HP (format internasional, contoh: +628xxx)")
-            log.warning("  2) Kode OTP yang dikirim Telegram")
-            log.warning("  3) Password 2FA (kalau akun mengaktifkan)")
+            log.warning("Session userbot BELUM ADA. Login interaktif:")
+            log.warning("  1) Nomor HP (contoh: +628xxxx)")
+            log.warning("  2) Kode OTP")
+            log.warning("  3) Password 2FA (jika ada)")
             log.warning("=" * 60)
-            # client.start() handle phone + code + 2FA password lewat input()
             await self.client.start()
         self._me = await self.client.get_me()
         log.info("Userbot login as @%s (id=%s)", self._me.username, self._me.id)
 
-        # warm up cache
-        for cid in await self.db.get_all_channel_chat_ids():
+        # Migrasi chat_id ke format canonical (event.chat_id format)
+        for ch in await self.db.get_all_channels_full():
             try:
-                await self.client.get_entity(cid)
+                entity = await self.client.get_entity(ch["chat_id"])
+                canonical = tl_utils.get_peer_id(entity)
+                if canonical != ch["chat_id"]:
+                    log.warning(
+                        "[migrate] channel db_id=%s chat_id %s -> %s",
+                        ch["id"], ch["chat_id"], canonical,
+                    )
+                    await self.db.update_channel_chat_id(ch["id"], canonical)
             except Exception as e:
-                log.warning("Resolve channel %s gagal: %s", cid, e)
+                log.warning(
+                    "Resolve channel %s gagal saat warm-up: %s",
+                    ch["chat_id"], e,
+                )
 
         self.client.add_event_handler(self._on_message, events.NewMessage())
+        log.info("Userbot listening untuk pesan baru...")
 
     async def run(self) -> None:
         await self.client.run_until_disconnected()
@@ -343,25 +547,22 @@ class Userbot:
             text = event.message.message or ""
             if not text:
                 return
-            bots = await self.db.get_bots_for_channel(chat_id)
-            if not bots:
+            # HOT PATH: zero DB roundtrip
+            matches = self.cache.lookup(chat_id, text.lower())
+            if not matches:
                 return
-            text_lower = text.lower()
-            for bot_row in bots:
-                triggers = await self.db.get_triggers_for_bot(bot_row["id"])
-                matched = next(
-                    (t for t in triggers if t["keyword"].lower() in text_lower),
-                    None,
-                )
-                if not matched:
-                    continue
-                link = await self._build_link(event)
-                await self.child_manager.notify_owner(
-                    bot_row=bot_row,
-                    keyword=matched["keyword"],
-                    link=link,
-                    text=text,
-                    chat_title=getattr(event.chat, "title", None) or "",
+            link = await self._build_link(event)
+            chat_title = getattr(event.chat, "title", None) or ""
+            for bot_meta, keyword in matches:
+                # fire-and-forget supaya 1 send tidak blocking yang lain
+                asyncio.create_task(
+                    self.child_manager.notify_owner(
+                        bot_meta=bot_meta,
+                        keyword=keyword,
+                        link=link,
+                        text=text,
+                        chat_title=chat_title,
+                    )
                 )
         except Exception:
             log.exception("Error handling new message")
@@ -372,13 +573,62 @@ class Userbot:
         username = getattr(chat, "username", None)
         if username:
             return f"https://t.me/{username}/{msg_id}"
-        chat_id_str = str(chat.id)
-        if chat_id_str.startswith("-100"):
-            chat_id_str = chat_id_str[4:]
-        return f"https://t.me/c/{chat_id_str}/{msg_id}"
+        raw_id = getattr(chat, "id", None)
+        if raw_id is None:
+            return ""
+        return f"https://t.me/c/{raw_id}/{msg_id}"
 
     async def join_channel(self, identifier: str):
-        entity = await self.client.get_entity(identifier)
+        """Join channel berdasarkan @username, t.me link, atau invite link.
+
+        Kalau sudah join, return entity tanpa error (idempotent).
+        Kalau belum, otomatis join.
+        """
+        ident = identifier.strip()
+
+        # detect invite hash
+        invite_hash = None
+        for prefix in ("https://t.me/joinchat/", "http://t.me/joinchat/",
+                       "t.me/joinchat/", "joinchat/"):
+            if ident.startswith(prefix):
+                invite_hash = ident[len(prefix):]
+                break
+        if invite_hash is None:
+            for prefix in ("https://t.me/+", "http://t.me/+", "t.me/+"):
+                if ident.startswith(prefix):
+                    invite_hash = ident[len(prefix):]
+                    break
+
+        if invite_hash:
+            invite_hash = invite_hash.split("/")[0].split("?")[0]
+            try:
+                info = await self.client(CheckChatInviteRequest(invite_hash))
+                if hasattr(info, "chat") and info.chat is not None:
+                    return info.chat
+                upd = await self.client(ImportChatInviteRequest(invite_hash))
+                if getattr(upd, "chats", None):
+                    return upd.chats[0]
+                raise RuntimeError("Tidak bisa resolve channel dari invite link.")
+            except UserAlreadyParticipantError:
+                info = await self.client(CheckChatInviteRequest(invite_hash))
+                if hasattr(info, "chat") and info.chat is not None:
+                    return info.chat
+                raise RuntimeError("Sudah join tapi tidak bisa resolve chat.")
+            except (InviteHashExpiredError, InviteHashInvalidError):
+                raise RuntimeError("Invite link expired/invalid.")
+            except FloodWaitError as e:
+                raise RuntimeError(f"FloodWait {e.seconds}s, coba lagi nanti.")
+
+        # public username / t.me link
+        for prefix in ("https://t.me/", "http://t.me/", "t.me/"):
+            if ident.startswith(prefix):
+                ident = ident[len(prefix):]
+                break
+        ident = ident.lstrip("@").split("/")[0].split("?")[0]
+        if not ident:
+            raise RuntimeError("Identifier kosong.")
+        entity = await self.client.get_entity(ident)
+        # auto-join kalau belum
         try:
             await self.client(JoinChannelRequest(entity))
         except UserAlreadyParticipantError:
@@ -391,40 +641,17 @@ class Userbot:
 
 
 # =============================================================================
-# MAIN BOT (aiogram + premium emoji)
+# SAFE BOT — auto fallback premium emoji invalid
 # =============================================================================
-TOKEN_RE = re.compile(r"^\d{6,12}:[A-Za-z0-9_-]{30,}$")
-
-# Telegram menolak premium emoji yang invalid dengan error berikut:
-_PREMIUM_REJECT_TOKENS = ("DOCUMENT_INVALID", "MEDIA_INVALID",
-                          "EMOJI_INVALID", "CUSTOM_EMOJI")
-_TG_EMOJI_RE = re.compile(r"<tg-emoji[^>]*>(.*?)</tg-emoji>", re.DOTALL)
-
-
-def _strip_premium_emoji_html(s: str) -> str:
-    """Replace <tg-emoji ...>FALLBACK</tg-emoji> with FALLBACK text."""
-    return _TG_EMOJI_RE.sub(r"\1", s)
-
-
 class SafeBot(Bot):
-    """Bot yang otomatis fallback kalau premium emoji ditolak Telegram.
-
-    Beberapa premium emoji ID mungkin tidak bisa diakses oleh bot
-    (placeholder ID, sticker premium yang tidak available, dll).
-    Telegram membalas DOCUMENT_INVALID / MEDIA_INVALID / EMOJI_INVALID
-    untuk seluruh pesan. Tanpa fallback, bot akan crash dan user
-    tidak terima apa pun.
-
-    SafeBot men-catch error itu, strip semua <tg-emoji> tag jadi
-    fallback emoji biasa, lalu retry.
-    """
+    """Wrapper Bot yang otomatis strip premium emoji kalau Telegram menolak."""
 
     async def __call__(self, method, request_timeout=None):
         try:
             return await super().__call__(method, request_timeout=request_timeout)
         except TelegramBadRequest as e:
             err = str(e).upper()
-            if not any(tok in err for tok in _PREMIUM_REJECT_TOKENS):
+            if not any(tok in err for tok in _PREMIUM_REJECT):
                 raise
             updates = {}
             for field in ("text", "caption"):
@@ -433,12 +660,15 @@ class SafeBot(Bot):
                     updates[field] = _strip_premium_emoji_html(val)
             if not updates:
                 raise
-            log.warning(
-                "Premium emoji ditolak Telegram (%s), retry tanpa premium emoji.",
-                e.message if hasattr(e, "message") else e,
-            )
+            log.warning("Premium emoji ditolak, retry tanpa premium emoji")
             method2 = method.model_copy(update=updates)
             return await super().__call__(method2, request_timeout=request_timeout)
+
+
+# =============================================================================
+# MAIN BOT (premium emoji)
+# =============================================================================
+TOKEN_RE = re.compile(r"^\d{6,12}:[A-Za-z0-9_-]{30,}$")
 
 
 def _kb(*rows) -> InlineKeyboardMarkup:
@@ -454,13 +684,15 @@ class AddBotState(StatesGroup):
 
 
 class MainBot:
-    def __init__(self, token: str, db: Database, child_manager: "ChildBotManager"):
+    def __init__(self, token: str, db: Database, cache: TriggerCache,
+                 child_manager: "ChildBotManager"):
         self.bot = SafeBot(
             token=token,
             default=DefaultBotProperties(parse_mode=ParseMode.HTML),
         )
         self.dp = Dispatcher()
         self.db = db
+        self.cache = cache
         self.child_manager = child_manager
         self._register()
 
@@ -489,18 +721,17 @@ class MainBot:
     def _welcome(self, name: str) -> str:
         return (
             f"{E_CROWN} <b>Halo {html.escape(name)}!</b>\n\n"
-            f"{E_ROBOT} Bot ini adalah <b>Main Bot</b> untuk membuat & mengelola "
+            f"{E_ROBOT} Bot ini adalah <b>Main Bot</b> untuk mengelola "
             f"<b>bot anak</b> yang memantau channel Telegram.\n\n"
             f"{E_INFO} <b>Cara kerja:</b>\n"
             f"  • Buat bot di @BotFather, dapatkan token\n"
             f"  • Tambahkan token-nya di sini\n"
             f"  • Pakai bot anak untuk add <b>channel</b> + <b>trigger</b>\n"
             f"  • Saat trigger cocok di channel, kamu dapat notif + link\n\n"
-            f"{E_LOCK} Setiap bot anak hanya bisa dipakai owner-nya.\n\n"
+            f"{E_LOCK} Bot anak hanya bisa dipakai owner-nya.\n\n"
             f"{E_ROCKET} Pilih menu di bawah:"
         )
 
-    # commands
     async def cmd_start(self, message: Message, state: FSMContext) -> None:
         await state.clear()
         if not _is_admin(message.from_user.id):
@@ -534,7 +765,6 @@ class MainBot:
     async def cmd_mybots(self, message: Message) -> None:
         await self._send_my_bots(message.chat.id, message.from_user.id)
 
-    # callbacks
     async def cb_addbot(self, query: CallbackQuery, state: FSMContext) -> None:
         if not _is_admin(query.from_user.id):
             await query.answer("Ditolak.", show_alert=True)
@@ -608,17 +838,17 @@ class MainBot:
             return
         await self.child_manager.remove_bot(row["id"])
         await self.db.delete_child_bot(row["id"], query.from_user.id)
+        await self.cache.evict_bot(row["id"])
         await query.answer("Terhapus.")
         await self._send_my_bots(query.message.chat.id, query.from_user.id, edit=query.message)
 
-    # flow
     async def _prompt_token(self, target: Message, state: FSMContext) -> None:
         await state.set_state(AddBotState.waiting_token)
         kb = _kb([InlineKeyboardButton(text="« Batal", callback_data="back")])
         await target.answer(
             f"{E_INFO} <b>Kirim token bot anak.</b>\n\n"
-            f"Buat bot baru di <a href='https://t.me/BotFather'>@BotFather</a>, "
-            f"copy token-nya, lalu paste di sini.\n\n"
+            f"Buat bot di <a href='https://t.me/BotFather'>@BotFather</a>, "
+            f"copy token, paste di sini.\n\n"
             f"Format: <code>123456:ABC-DEF...</code>",
             reply_markup=kb,
             disable_web_page_preview=True,
@@ -642,14 +872,13 @@ class MainBot:
             await message.answer(f"{E_WARN} Bot ini sudah terdaftar.")
             await state.clear()
             return
-
         bot_db_id = await self.db.add_child_bot(
             token=token, bot_id=me.id,
             bot_username=me.username, owner_id=message.from_user.id,
         )
         await self.child_manager.add_bot(token=token, bot_db_id=bot_db_id)
+        await self.cache.reload_bot(bot_db_id)
         await state.clear()
-
         kb = _kb(
             [InlineKeyboardButton(
                 text="🤖 Buka Bot Anak",
@@ -704,14 +933,15 @@ class MainBot:
 
 
 # =============================================================================
-# CHILD BOT (dispatcher bersama untuk semua bot anak)
+# CHILD BOT DISPATCHER (1 dispatcher dipakai semua bot anak)
 # =============================================================================
 class ChildState(StatesGroup):
     add_channel = State()
     add_trigger = State()
 
 
-def build_child_dispatcher(db: Database, userbot: Userbot) -> Dispatcher:
+def build_child_dispatcher(db: Database, cache: TriggerCache,
+                           userbot: Userbot) -> Dispatcher:
     dp = Dispatcher()
 
     async def _bot_row(bot: Bot):
@@ -725,31 +955,34 @@ def build_child_dispatcher(db: Database, userbot: Userbot) -> Dispatcher:
             if isinstance(event, CallbackQuery):
                 await event.answer("🔒 Bot ini privat.", show_alert=True)
             else:
-                await event.answer("🔒 Bot ini privat. Hanya owner yang bisa pakai.")
+                await event.answer("🔒 Bot ini privat.")
             return None
         return row
+
+    def _home_kb() -> InlineKeyboardMarkup:
+        return _kb(
+            [InlineKeyboardButton(text="📢 Channel", callback_data="ch:menu"),
+             InlineKeyboardButton(text="🔔 Trigger", callback_data="tg:menu")],
+            [InlineKeyboardButton(text="📋 Status", callback_data="status"),
+             InlineKeyboardButton(text="🛠 Debug", callback_data="debug")],
+        )
 
     async def _show_status(target: Message, row, edit: bool = False) -> None:
         chs = await db.get_channels_for_bot(row["id"])
         tgs = await db.get_triggers_for_bot(row["id"])
         text = (
-            f"📋 <b>Status Bot</b>\n\n"
+            f"📋 <b>Status</b>\n\n"
             f"🤖 @{html.escape(row['bot_username'])}\n"
             f"📢 Channel : <b>{len(chs)}</b>\n"
             f"🔔 Trigger : <b>{len(tgs)}</b>"
         )
-        kb = _kb(
-            [InlineKeyboardButton(text="📢 Channel", callback_data="ch:menu"),
-             InlineKeyboardButton(text="🔔 Trigger", callback_data="tg:menu")],
-            [InlineKeyboardButton(text="🏠 Home", callback_data="home")],
-        )
         if edit:
             try:
-                await target.edit_text(text, reply_markup=kb)
+                await target.edit_text(text, reply_markup=_home_kb())
                 return
             except TelegramBadRequest:
                 pass
-        await target.answer(text, reply_markup=kb)
+        await target.answer(text, reply_markup=_home_kb())
 
     async def _show_channels(target: Message, row, edit: bool = False) -> None:
         chs = await db.get_channels_for_bot(row["id"])
@@ -807,8 +1040,12 @@ def build_child_dispatcher(db: Database, userbot: Userbot) -> Dispatcher:
         kb = _kb([InlineKeyboardButton(text="« Batal", callback_data="ch:menu")])
         await target.answer(
             "📢 <b>Tambah Channel</b>\n\n"
-            "Kirim <b>@username</b> channel atau <b>invite link</b>.\n"
-            "Akun tumbal akan otomatis bergabung untuk memantau.",
+            "Kirim salah satu format:\n"
+            "  • <code>@username</code>\n"
+            "  • <code>https://t.me/username</code>\n"
+            "  • <code>https://t.me/+abc...</code> (private invite)\n"
+            "  • <code>https://t.me/joinchat/abc...</code>\n\n"
+            "ℹ️ Akun tumbal akan <b>otomatis join</b> jika belum.",
             reply_markup=kb,
         )
 
@@ -818,11 +1055,10 @@ def build_child_dispatcher(db: Database, userbot: Userbot) -> Dispatcher:
         await target.answer(
             "🔔 <b>Tambah Trigger</b>\n\n"
             "Kirim keyword (min. 2 karakter).\n"
-            "Match dilakukan <b>case-insensitive</b> (substring).",
+            "Match <b>case-insensitive</b> (substring).",
             reply_markup=kb,
         )
 
-    # ---- /start ----
     @dp.message(CommandStart())
     async def start_cmd(message: Message, bot: Bot, state: FSMContext) -> None:
         await state.clear()
@@ -831,18 +1067,12 @@ def build_child_dispatcher(db: Database, userbot: Userbot) -> Dispatcher:
             return
         text = (
             f"👑 <b>Halo Owner!</b>\n\n"
-            f"🤖 Ini bot anak <b>@{html.escape(row['bot_username'])}</b>.\n\n"
-            f"📢 Tambah channel yang mau dipantau.\n"
-            f"🔔 Tambah trigger keyword.\n\n"
-            f"Saat ada pesan baru di channel yang cocok dengan trigger, "
-            f"kamu akan dapat notifikasi + link pesan."
+            f"🤖 Bot anak <b>@{html.escape(row['bot_username'])}</b>.\n\n"
+            f"📢 Tambah channel.\n"
+            f"🔔 Tambah trigger.\n"
+            f"📲 Notif otomatis saat ada match."
         )
-        kb = _kb(
-            [InlineKeyboardButton(text="📢 Channel", callback_data="ch:menu"),
-             InlineKeyboardButton(text="🔔 Trigger", callback_data="tg:menu")],
-            [InlineKeyboardButton(text="📋 Status", callback_data="status")],
-        )
-        await message.answer(text, reply_markup=kb)
+        await message.answer(text, reply_markup=_home_kb())
 
     @dp.message(Command("help"))
     async def help_cmd(message: Message, bot: Bot) -> None:
@@ -850,10 +1080,11 @@ def build_child_dispatcher(db: Database, userbot: Userbot) -> Dispatcher:
             return
         await message.answer(
             "<b>Perintah:</b>\n"
-            "  /start - menu utama\n"
+            "  /start - menu\n"
             "  /addchannel - tambah channel\n"
-            "  /addtrigger - tambah trigger keyword\n"
-            "  /list - lihat channel & trigger"
+            "  /addtrigger - tambah trigger\n"
+            "  /list - status singkat\n"
+            "  /debug - info diagnostik"
         )
 
     @dp.message(Command("addchannel"))
@@ -874,7 +1105,51 @@ def build_child_dispatcher(db: Database, userbot: Userbot) -> Dispatcher:
         if row:
             await _show_status(message, row)
 
-    # ---- nav ----
+    @dp.message(Command("debug"))
+    async def debug_cmd(message: Message, bot: Bot) -> None:
+        row = await _owner_only(message, bot)
+        if not row:
+            return
+        chs = await db.get_channels_for_bot(row["id"])
+        tgs = await db.get_triggers_for_bot(row["id"])
+        ub_status = "OFFLINE"
+        ub_id = ub_user = "-"
+        try:
+            if userbot.client.is_connected() and userbot._me is not None:
+                ub_status = "ONLINE"
+                ub_id = userbot._me.id
+                ub_user = f"@{userbot._me.username}" if userbot._me.username else "-"
+        except Exception:
+            pass
+        ch_lines = []
+        for c in chs:
+            line = f"  • <code>{c['chat_id']}</code> — {html.escape(c['title'] or '')}"
+            if c["username"]:
+                line += f" (@{c['username']})"
+            ch_lines.append(line)
+        tg_lines = [f"  • <code>{html.escape(t['keyword'])}</code>" for t in tgs]
+        cache_chans = sum(1 for cid in cache.chat_index if row["id"] in cache.chat_index[cid])
+        cache_trigs = len(cache.triggers.get(row["id"], []))
+        text = (
+            f"🛠 <b>Debug</b>\n\n"
+            f"<b>Bot anak</b>\n"
+            f"  db_id   : <code>{row['id']}</code>\n"
+            f"  bot_id  : <code>{row['bot_id']}</code>\n"
+            f"  owner   : <code>{row['owner_id']}</code>\n"
+            f"  active  : <code>{row['active']}</code>\n\n"
+            f"<b>Userbot</b>\n"
+            f"  status  : <code>{ub_status}</code>\n"
+            f"  user    : <code>{ub_user}</code> (<code>{ub_id}</code>)\n\n"
+            f"<b>Cache</b>\n"
+            f"  channels: <code>{cache_chans}</code>\n"
+            f"  triggers: <code>{cache_trigs}</code>\n\n"
+            f"<b>Channel ({len(chs)})</b>\n"
+            + ("\n".join(ch_lines) if ch_lines else "  <i>(kosong)</i>")
+            + f"\n\n<b>Trigger ({len(tgs)})</b>\n"
+            + ("\n".join(tg_lines) if tg_lines else "  <i>(kosong)</i>")
+        )
+        await message.answer(text)
+
     @dp.callback_query(F.data == "home")
     async def cb_home(query: CallbackQuery, bot: Bot, state: FSMContext) -> None:
         await state.clear()
@@ -886,15 +1161,10 @@ def build_child_dispatcher(db: Database, userbot: Userbot) -> Dispatcher:
             f"👑 <b>Halo Owner!</b>\n\n"
             f"🤖 Bot anak <b>@{html.escape(row['bot_username'])}</b>.\n\nPilih menu:"
         )
-        kb = _kb(
-            [InlineKeyboardButton(text="📢 Channel", callback_data="ch:menu"),
-             InlineKeyboardButton(text="🔔 Trigger", callback_data="tg:menu")],
-            [InlineKeyboardButton(text="📋 Status", callback_data="status")],
-        )
         try:
-            await query.message.edit_text(text, reply_markup=kb)
+            await query.message.edit_text(text, reply_markup=_home_kb())
         except TelegramBadRequest:
-            await query.message.answer(text, reply_markup=kb)
+            await query.message.answer(text, reply_markup=_home_kb())
 
     @dp.callback_query(F.data == "status")
     async def cb_status(query: CallbackQuery, bot: Bot) -> None:
@@ -904,7 +1174,13 @@ def build_child_dispatcher(db: Database, userbot: Userbot) -> Dispatcher:
         await query.answer()
         await _show_status(query.message, row, edit=True)
 
-    # ---- channel callbacks ----
+    @dp.callback_query(F.data == "debug")
+    async def cb_debug(query: CallbackQuery, bot: Bot) -> None:
+        if not await _owner_only(query, bot):
+            return
+        await query.answer()
+        await debug_cmd(query.message, bot)
+
     @dp.callback_query(F.data == "ch:menu")
     async def cb_ch_menu(query: CallbackQuery, bot: Bot) -> None:
         row = await _owner_only(query, bot)
@@ -927,6 +1203,7 @@ def build_child_dispatcher(db: Database, userbot: Userbot) -> Dispatcher:
             return
         ch_id = int(query.data.split(":")[2])
         await db.unlink_bot_channel(row["id"], ch_id)
+        await cache.reload_bot(row["id"])
         await query.answer("Channel dihapus.")
         await _show_channels(query.message, row, edit=True)
 
@@ -937,30 +1214,30 @@ def build_child_dispatcher(db: Database, userbot: Userbot) -> Dispatcher:
             return
         ident = (message.text or "").strip()
         if not ident:
-            await message.answer("⚠️ Format salah. Kirim @username atau invite link.")
+            await message.answer("⚠️ Format salah.")
             return
+        progress = await message.answer("⏳ Mencoba join channel...")
         try:
             entity = await userbot.join_channel(ident)
         except Exception as e:
-            await message.answer(
-                f"⚠️ Gagal join channel: <code>{html.escape(str(e))}</code>"
+            await progress.edit_text(
+                f"⚠️ Gagal: <code>{html.escape(str(e))}</code>"
             )
             return
 
-        chat_id_raw = getattr(entity, "id", None)
-        if chat_id_raw is None:
-            await message.answer("⚠️ Gagal resolve channel.")
-            return
-        is_channel = (
-            getattr(entity, "broadcast", False)
-            or getattr(entity, "megagroup", False)
-        )
-        chat_id_full = int(f"-100{chat_id_raw}") if is_channel else chat_id_raw
+        try:
+            chat_id_full = tl_utils.get_peer_id(entity)
+        except Exception:
+            raw = getattr(entity, "id", 0)
+            is_ch = (getattr(entity, "broadcast", False)
+                     or getattr(entity, "megagroup", False))
+            chat_id_full = int(f"-100{raw}") if is_ch else raw
         title = getattr(entity, "title", "") or ""
         username = getattr(entity, "username", None)
 
         ch_db_id = await db.upsert_channel(chat_id_full, title, username)
         linked = await db.link_bot_channel(row["id"], ch_db_id)
+        await cache.reload_bot(row["id"])
         await state.clear()
 
         if linked:
@@ -971,12 +1248,14 @@ def build_child_dispatcher(db: Database, userbot: Userbot) -> Dispatcher:
                 + (f"\n🔗 @{username}" if username else "")
             )
         else:
-            txt = f"⚠️ Channel <b>{html.escape(title)}</b> sudah terdaftar di bot ini."
+            txt = f"⚠️ Channel <b>{html.escape(title)}</b> sudah terdaftar."
         kb = _kb([InlineKeyboardButton(text="« Channel", callback_data="ch:menu"),
                   InlineKeyboardButton(text="🏠 Home", callback_data="home")])
-        await message.answer(txt, reply_markup=kb)
+        try:
+            await progress.edit_text(txt, reply_markup=kb)
+        except TelegramBadRequest:
+            await message.answer(txt, reply_markup=kb)
 
-    # ---- trigger callbacks ----
     @dp.callback_query(F.data == "tg:menu")
     async def cb_tg_menu(query: CallbackQuery, bot: Bot) -> None:
         row = await _owner_only(query, bot)
@@ -999,6 +1278,7 @@ def build_child_dispatcher(db: Database, userbot: Userbot) -> Dispatcher:
             return
         tg_id = int(query.data.split(":")[2])
         await db.remove_trigger(tg_id, row["id"])
+        await cache.reload_bot(row["id"])
         await query.answer("Trigger dihapus.")
         await _show_triggers(query.message, row, edit=True)
 
@@ -1012,6 +1292,7 @@ def build_child_dispatcher(db: Database, userbot: Userbot) -> Dispatcher:
             await message.answer("⚠️ Keyword minimal 2 karakter.")
             return
         ok = await db.add_trigger(row["id"], kw)
+        await cache.reload_bot(row["id"])
         await state.clear()
         kb = _kb([InlineKeyboardButton(text="« Trigger", callback_data="tg:menu"),
                   InlineKeyboardButton(text="🏠 Home", callback_data="home")])
@@ -1023,7 +1304,6 @@ def build_child_dispatcher(db: Database, userbot: Userbot) -> Dispatcher:
         else:
             await message.answer("⚠️ Trigger sudah ada.", reply_markup=kb)
 
-    # ---- fallback ----
     @dp.message()
     async def fallback(message: Message, bot: Bot) -> None:
         row = await _bot_row(bot)
@@ -1039,8 +1319,9 @@ def build_child_dispatcher(db: Database, userbot: Userbot) -> Dispatcher:
 # CHILD BOT MANAGER
 # =============================================================================
 class ChildBotManager:
-    def __init__(self, db: Database):
+    def __init__(self, db: Database, cache: TriggerCache):
         self.db = db
+        self.cache = cache
         self.userbot: Optional[Userbot] = None
         self.dp: Optional[Dispatcher] = None
         self.bots: dict[int, Bot] = {}
@@ -1048,7 +1329,7 @@ class ChildBotManager:
 
     def set_userbot(self, userbot: Userbot) -> None:
         self.userbot = userbot
-        self.dp = build_child_dispatcher(self.db, userbot)
+        self.dp = build_child_dispatcher(self.db, self.cache, userbot)
 
     async def start(self) -> None:
         if self.dp is None:
@@ -1056,43 +1337,34 @@ class ChildBotManager:
         rows = await self.db.get_all_child_bots()
         ok, fail = 0, 0
         for r in rows:
-            spawned = await self.add_bot(token=r["token"], bot_db_id=r["id"])
-            if spawned:
+            if await self.add_bot(token=r["token"], bot_db_id=r["id"]):
                 ok += 1
             else:
                 fail += 1
-        log.info(
-            "ChildBotManager started: %d active, %d skipped (invalid).",
-            ok, fail,
-        )
+        log.info("ChildBotManager: %d active, %d skipped", ok, fail)
 
     async def add_bot(self, token: str, bot_db_id: int) -> bool:
-        """Spawn polling task untuk bot anak. Return True kalau sukses,
-        False kalau token invalid (bot dinonaktifkan di DB, tidak crash).
-        """
         if bot_db_id in self.bots:
             return True
         bot = Bot(
             token=token,
             default=DefaultBotProperties(parse_mode=ParseMode.HTML),
         )
-        # Validasi token sebelum mulai polling, supaya 1 token rusak
-        # tidak menjatuhkan service.
         try:
             await bot.get_me()
         except Exception as e:
-            log.warning(
-                "Skip bot anak db_id=%s, token invalid: %s",
-                bot_db_id, e,
-            )
+            log.warning("Skip child bot db_id=%s, token invalid: %s", bot_db_id, e)
             try:
                 await bot.session.close()
             except Exception:
                 pass
             await self.db.deactivate_child_bot(bot_db_id)
+            await self.cache.evict_bot(bot_db_id)
             return False
         self.bots[bot_db_id] = bot
-        self.tasks[bot_db_id] = asyncio.create_task(self._poll(bot, bot_db_id))
+        self.tasks[bot_db_id] = asyncio.create_task(
+            self._poll(bot, bot_db_id), name=f"child_bot_{bot_db_id}"
+        )
         log.info("Spawned child bot db_id=%s", bot_db_id)
         return True
 
@@ -1103,8 +1375,7 @@ class ChildBotManager:
             raise
         except Exception:
             log.exception(
-                "Child bot polling crashed db_id=%s (bot tetap nonaktif "
-                "sampai restart, service lain jalan terus)",
+                "Child bot polling crashed db_id=%s (service lain jalan terus)",
                 bot_db_id,
             )
 
@@ -1124,11 +1395,12 @@ class ChildBotManager:
                 pass
         log.info("Removed child bot db_id=%s", bot_db_id)
 
-    async def notify_owner(self, bot_row, keyword: str, link: str,
+    async def notify_owner(self, bot_meta: dict, keyword: str, link: str,
                            text: str, chat_title: str = "") -> None:
-        bot = self.bots.get(bot_row["id"])
+        bot_db_id = bot_meta["id"]
+        bot = self.bots.get(bot_db_id)
         if bot is None:
-            log.warning("notify_owner: bot %s not running", bot_row["id"])
+            log.debug("notify_owner: bot db_id=%s tidak running", bot_db_id)
             return
 
         snippet = text.strip()
@@ -1141,42 +1413,68 @@ class ChildBotManager:
             f"📝 <blockquote expandable>{html.escape(snippet)}</blockquote>"
         )
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔗 Buka Pesan", url=link)],
+            [InlineKeyboardButton(text="🔗 Buka Pesan", url=link)] if link else [],
         ])
-        try:
-            await bot.send_message(
-                chat_id=bot_row["owner_id"],
-                text=msg,
-                reply_markup=kb,
-                disable_web_page_preview=False,
-            )
-        except Exception as e:
-            log.warning("Gagal kirim notifikasi ke %s: %s", bot_row["owner_id"], e)
+        kb.inline_keyboard = [r for r in kb.inline_keyboard if r]
+
+        # retry loop dengan FloodWait awareness
+        for attempt in range(3):
+            try:
+                await bot.send_message(
+                    chat_id=bot_meta["owner_id"],
+                    text=msg,
+                    reply_markup=kb if kb.inline_keyboard else None,
+                    disable_web_page_preview=False,
+                )
+                log.info(
+                    "[notify] sent owner=%s bot_db_id=%s keyword=%r",
+                    bot_meta["owner_id"], bot_db_id, keyword,
+                )
+                return
+            except TelegramRetryAfter as e:
+                await asyncio.sleep(e.retry_after)
+                continue
+            except TelegramForbiddenError:
+                # owner block bot -> nonaktifkan
+                log.warning(
+                    "Owner %s block bot db_id=%s, nonaktifkan",
+                    bot_meta["owner_id"], bot_db_id,
+                )
+                await self.db.deactivate_child_bot(bot_db_id)
+                await self.cache.evict_bot(bot_db_id)
+                await self.remove_bot(bot_db_id)
+                return
+            except TelegramBadRequest as e:
+                log.warning("BadRequest saat kirim notif: %s", e)
+                return
+            except Exception as e:
+                log.warning("Gagal kirim notif (attempt %d): %s", attempt + 1, e)
+                await asyncio.sleep(1)
+        log.warning("Notif ke owner=%s gagal setelah 3 attempt", bot_meta["owner_id"])
 
 
 # =============================================================================
 # ENTRY POINT
 # =============================================================================
-async def auth_userbot() -> None:
-    """Login interaktif akun tumbal (sekali saja)."""
-    client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
-    await client.start()  # akan minta phone + OTP
-    me = await client.get_me()
-    print(f"Login sukses sebagai @{me.username} (id={me.id})")
-    await client.disconnect()
-
-
 async def run_all() -> None:
     db = Database(DB_PATH)
     await db.init()
 
-    child_manager = ChildBotManager(db)
-    userbot = Userbot(API_ID, API_HASH, SESSION_NAME, db, child_manager)
+    cache = TriggerCache(db)
+
+    child_manager = ChildBotManager(db, cache)
+    userbot = Userbot(API_ID, API_HASH, SESSION_NAME, db, cache, child_manager)
     child_manager.set_userbot(userbot)
-    main_bot = MainBot(BOT_TOKEN, db, child_manager)
+    main_bot = MainBot(BOT_TOKEN, db, cache, child_manager)
 
     await userbot.start()
+    await cache.reload_all()
     await child_manager.start()
+
+    log.info(
+        "READY. cache: %d channels, %d bots, %d trigger groups",
+        len(cache.chat_index), len(cache.bot_meta), len(cache.triggers),
+    )
 
     stop = asyncio.Event()
 
@@ -1217,20 +1515,34 @@ async def run_all() -> None:
             await userbot.client.disconnect()
         except Exception:
             pass
+        try:
+            await db.close()
+        except Exception:
+            pass
 
 
 def cli() -> None:
+    level = logging.DEBUG if os.environ.get("LOG_DEBUG") else logging.INFO
     logging.basicConfig(
-        level=logging.INFO,
+        level=level,
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     )
-    if len(sys.argv) > 1 and sys.argv[1] == "auth":
-        asyncio.run(auth_userbot())
-    else:
-        try:
-            asyncio.run(run_all())
-        except KeyboardInterrupt:
-            pass
+    logging.getLogger("telethon").setLevel(logging.WARNING)
+    logging.getLogger("aiogram").setLevel(logging.WARNING)
+    logging.getLogger("aiohttp").setLevel(logging.WARNING)
+
+    # uvloop kalau tersedia (lebih cepat dari asyncio default)
+    try:
+        import uvloop  # type: ignore
+        uvloop.install()
+        log.info("uvloop enabled")
+    except ImportError:
+        pass
+
+    try:
+        asyncio.run(run_all())
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":
