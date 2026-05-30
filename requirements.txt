@@ -1,3 +1,5 @@
 aiogram>=3.4.0
 telethon>=1.34.0
 aiosqlite>=0.19.0
+# Optional, untuk speedup event loop di Linux/macOS:
+uvloop>=0.19.0; sys_platform != "win32"
